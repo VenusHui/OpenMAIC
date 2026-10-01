@@ -33,7 +33,8 @@ import { ensureOwnerMergeSchema, fenceOwnerWrite } from './owner-merges';
 export const OWNER_MATERIAL_STATUSES = ['uploading', 'ready'] as const;
 export type OwnerMaterialStatus = (typeof OWNER_MATERIAL_STATUSES)[number];
 
-export const OWNER_MATERIAL_KINDS = ['source', 'web'] as const;
+/** `image` rows are extraction derivatives of a source (`derivedFrom`). */
+export const OWNER_MATERIAL_KINDS = ['source', 'web', 'image'] as const;
 export type OwnerMaterialKind = (typeof OWNER_MATERIAL_KINDS)[number];
 
 export interface OwnerMaterialExtraction {
@@ -161,6 +162,32 @@ $$;
 ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS asset_id TEXT;
 ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS folder_id TEXT;
 ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS display_name TEXT;
+
+-- Owner-level extraction (./owner-material-extraction.ts). The status stays in
+-- the existing extraction JSONB, the one value the public view already
+-- shows; everything below is private bookkeeping the view never selects.
+-- Nullable or defaulted, so a process that predates them still inserts.
+-- extraction_token names the current claim; every claim gets a fresh one,
+-- so a superseded worker can never be mistaken for the current one.
+-- extraction_claims counts claims since the last explicit start (the
+-- budget); extraction_lease_at is the claim's last heartbeat in epoch ms.
+-- extraction_result is the latest successful extraction, its revision
+-- included; extraction_cache_key is what another source of the same owner
+-- looks it up by.
+ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS extraction_token TEXT;
+ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS extraction_claims INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS extraction_lease_at DOUBLE PRECISION;
+ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS extraction_error TEXT;
+ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS extraction_result JSONB;
+ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS extraction_cache_key TEXT;
+
+CREATE INDEX IF NOT EXISTS owner_material_extraction_queue_idx
+  ON owner_material (created_at)
+  WHERE kind = 'source' AND (extraction->>'status') IN ('pending', 'running');
+
+CREATE INDEX IF NOT EXISTS owner_material_extraction_cache_idx
+  ON owner_material (owner_id, extraction_cache_key)
+  WHERE extraction_cache_key IS NOT NULL;
 
 -- Flat, owner-scoped material folders. Unfiled is folder_id IS NULL, not a
 -- row. Names are unique per owner by their normalized form, as course folders
