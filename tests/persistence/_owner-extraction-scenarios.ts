@@ -13,7 +13,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { ensureAgentSessionSchema } from '@openmaic/storage/agent-session/pg';
 import { AssetCollector } from '@openmaic/storage/asset/collector';
-import { changeAssetRoots } from '@openmaic/storage/asset/pg';
+import { AssetRootTargetError, changeAssetRoots } from '@openmaic/storage/asset/pg';
 import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
 import { ensureUserSkillSchema } from '@openmaic/storage/skill/pg';
 import { expect, vi } from 'vitest';
@@ -605,7 +605,7 @@ export async function publishRollbackScenario(h: ExtractionHarness): Promise<voi
     stats: {},
   };
 
-  // A named entry that does not exist refuses the root call.
+  // A named entry that does not exist refuses the root call, before any write.
   await expect(
     publishOwnerMaterialExtraction(
       h.provider.withTransaction,
@@ -613,30 +613,40 @@ export async function publishRollbackScenario(h: ExtractionHarness): Promise<voi
       { ...base, text: { assetId: 'missing-asset', chars: 4 }, derivatives: [] },
       h.clock.now,
     ),
-  ).rejects.toThrow();
-  // A derivative row that cannot be inserted fails after the roots were written.
-  await expect(
-    publishOwnerMaterialExtraction(
-      h.provider.withTransaction,
-      current,
-      {
-        ...base,
-        derivatives: [
-          {
-            id: 'src-rollback',
-            kind: 'image',
-            assetId: allocated,
-            title: 'clash',
-            mime: 'image/png',
-            bytes: 4,
-            sha256: 'x',
-          },
-        ],
-      },
-      h.clock.now,
-    ),
-  ).rejects.toThrow();
+  ).rejects.toBeInstanceOf(AssetRootTargetError);
 
+  // A derivative row that cannot be inserted fails AFTER the root call wrote
+  // its rows, committed the entries and raised the rule version: the id is
+  // free as a root but already taken as a material. Everything must roll back.
+  await seedSource(h, 'src-occupied');
+  await h.pool.query('UPDATE asset_reference_tracking SET rule_version = 1');
+  const failure = await publishOwnerMaterialExtraction(
+    h.provider.withTransaction,
+    current,
+    {
+      ...base,
+      derivatives: [
+        {
+          id: 'src-occupied',
+          kind: 'image',
+          assetId: allocated,
+          title: 'clash',
+          mime: 'image/png',
+          bytes: 4,
+          sha256: 'x',
+        },
+      ],
+    },
+    h.clock.now,
+  ).catch((error: unknown) => error);
+  // A primary-key violation can only come from the derivative insert, which
+  // runs after the root call.
+  expect((failure as { code?: unknown }).code).toBe('23505');
+  const ruleVersion = await h.pool.query<{ v: number }>(
+    'SELECT rule_version AS v FROM asset_reference_tracking',
+  );
+  expect(Number(ruleVersion.rows[0]!.v)).toBe(1);
+  expect((await stateOf(h, 'src-occupied')).status).toBe('idle');
   expect(await stateOf(h, 'src-rollback')).toMatchObject({
     status: 'running',
     extraction_token: current.token,
@@ -659,6 +669,11 @@ export async function publishRollbackScenario(h: ExtractionHarness): Promise<voi
     ),
   ).toBe('published');
   expect(await rootsOf(h, 'src-rollback')).toEqual([allocated]);
+  // The same raise, committed this time.
+  const raised = await h.pool.query<{ v: number }>(
+    'SELECT rule_version AS v FROM asset_reference_tracking',
+  );
+  expect(Number(raised.rows[0]!.v)).toBe(2);
 }
 
 /**
