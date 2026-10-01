@@ -15,6 +15,7 @@ import {
   claimBudgetScenario,
   deletedSourceScenario,
   ensureStartedScenario,
+  fallbackReuseScenario,
   heartbeatLossScenario,
   mediaDerivativeScenario,
   ownerCacheScenario,
@@ -24,6 +25,7 @@ import {
   schemaCompatibilityScenario,
   supersededClaimScenario,
   twoConversationsOneExtractionScenario,
+  withdrawnDonorScenario,
   type ExtractionHarness,
   type ExtractionScenarioPool,
 } from './_owner-extraction-scenarios';
@@ -122,5 +124,13 @@ describe('owner-level material extraction (PGlite)', () => {
 
   it('keeps both results when a claim brings the same content into an account that has it', async () => {
     await claimIntoSameContentScenario(await boot());
+  });
+
+  it('reuses a document fallback s earlier result when the provider ahead of it fails', async () => {
+    await fallbackReuseScenario(await boot());
+  });
+
+  it('does not reuse a done donor that no longer roots its result', async () => {
+    await withdrawnDonorScenario(await boot());
   });
 });

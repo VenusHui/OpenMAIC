@@ -263,41 +263,65 @@ export async function runSourceExtraction(
 
   const errors: string[] = [];
   const failures: unknown[] = [];
-  let artifact: DocumentArtifact | undefined;
-  let selected: DocumentExtractorProvider | undefined;
   for (const provider of plan.candidates) {
+    let artifact: DocumentArtifact;
     try {
-      artifact = await provider.extract({
-        ...plan.input,
-        config: {
-          providerId: provider.id,
-          apiKey: resolvePDFApiKey(provider.id) || undefined,
-          baseUrl: resolvePDFBaseUrl(provider.id),
-          allowEnvFallback: true,
-          managed: true,
-        },
-      });
-      selected = provider;
-      break;
+      artifact = await extractWithDocumentProvider(provider, plan.input);
     } catch (error) {
-      errors.push(`${provider.id}: ${error instanceof Error ? error.message : String(error)}`);
+      errors.push(documentFailureLine(provider, error));
       failures.push(error);
+      continue;
     }
+    return documentOutcome(artifact, provider);
   }
-  if (!artifact || !selected) {
-    throw new MaterialExtractionError(
-      `document extraction failed (${errors.join('; ')})`,
-      failures.some(isTransientExtractionError),
-    );
-  }
+  throw documentExtractionFailure(errors, failures);
+}
 
+/** Run one document provider on a planned input; a failure is the provider's own error. */
+export function extractWithDocumentProvider(
+  provider: DocumentExtractorProvider,
+  input: Extract<SourceExtractionPlan, { kind: 'document' }>['input'],
+): Promise<DocumentArtifact> {
+  return provider.extract({
+    ...input,
+    config: {
+      providerId: provider.id,
+      apiKey: resolvePDFApiKey(provider.id) || undefined,
+      baseUrl: resolvePDFBaseUrl(provider.id),
+      allowEnvFallback: true,
+      managed: true,
+    },
+  });
+}
+
+/** One line of the combined failure message, for a provider that failed. */
+export function documentFailureLine(provider: DocumentExtractorProvider, error: unknown): string {
+  return `${provider.id}: ${error instanceof Error ? error.message : String(error)}`;
+}
+
+/** The failure once every document provider failed: retryable if any failure was transient. */
+export function documentExtractionFailure(
+  errors: string[],
+  failures: unknown[],
+): MaterialExtractionError {
+  return new MaterialExtractionError(
+    `document extraction failed (${errors.join('; ')})`,
+    failures.some(isTransientExtractionError),
+  );
+}
+
+/** What a document provider's artifact is kept as. */
+export function documentOutcome(
+  artifact: DocumentArtifact,
+  provider: DocumentExtractorProvider,
+): SourceExtractionOutcome {
   const text = artifactText(artifact);
   return {
     text,
     // Document images are not kept: the text is stored as the provider
     // returned it, the same output the session chain has always published.
     images: [],
-    extractor: { id: selected.id, version: selected.version },
+    extractor: { id: provider.id, version: provider.version },
     stats: {
       chars: text.length,
       pages: artifact.metadata.pageCount ?? 0,

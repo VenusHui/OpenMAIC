@@ -10,17 +10,20 @@
  *
  * 1. Read the source's bytes (`readSource`; today the neutral material byte
  *    store by the row's object key) and choose the extractor.
- * 2. Look for the owner's own earlier result under the same cache key and,
- *    when there is one, publish it for this source with derivatives of its
- *    own. A hit that no longer holds under lock is a miss.
+ * 2. Before each extractor runs -- the preferred one, then each document
+ *    fallback in turn -- look for the owner's own earlier result under that
+ *    extractor's cache key and, when there is one, publish it for this source
+ *    with derivatives of its own. A hit that no longer holds under lock is a
+ *    miss.
  * 3. Otherwise extract, then allocate each kept file as a pending pool entry
  *    in its own transaction, then publish everything in one more.
  *
- * Every allocation and the publication check the claim first; a claim that
- * lost its lease writes nothing. What this does not do: cancel a provider
- * call (none of them takes a signal) or bound how long one runs. A late
- * result is refused when it tries to publish; until then it only costs the
- * work.
+ * Every allocation and the publication check the claim first. A claim that
+ * is no longer current when it allocates stores nothing; one superseded while
+ * an allocation is under way can leave that pending entry behind, which it
+ * can never publish and which expires like any unpublished allocation. What
+ * this does not do: cancel a provider call (none of them takes a signal) or
+ * bound how long one runs. A late result is refused when it tries to publish.
  *
  * Document extraction keeps the text only, as the session chain does: images
  * a document provider returns are not stored, and the text is kept as the
@@ -51,15 +54,26 @@ import { forwardOwnerWrite } from '@/lib/persistence/owner-merges';
 import type { ServerPersistenceProvider } from '@/lib/persistence/server-provider';
 import { getMinerUBackend } from '@/lib/pdf/pdf-providers';
 import { getMaterialByteStore } from '@/lib/server/materials/bytes';
-import { resolveASRModel, resolveServerASRProviderId } from '@/lib/server/provider-config';
+import {
+  resolveASRBaseUrl,
+  resolveASRModel,
+  resolvePDFBaseUrl,
+  resolveServerASRProviderId,
+} from '@/lib/server/provider-config';
 
 import { isTransientExtractionError, MaterialExtractionError } from './errors';
 import {
   decodeMediaAssetData,
+  documentExtractionFailure,
+  documentFailureLine,
+  documentOutcome,
+  extractWithDocumentProvider,
   planSourceExtraction,
   plannedExtractor,
   runSourceExtraction,
   type ExtractorRegistryDependencies,
+  type SourceExtractionOutcome,
+  type SourceExtractionPlan,
 } from './extract';
 
 /**
@@ -92,16 +106,41 @@ export interface OwnerExtractionRunState {
 export type OwnerExtractionRunOutcome = PublishOutcome | 'reused';
 
 /**
+ * A configured endpoint as part of a cache key: scheme, host and path only.
+ * Credentials and query strings are dropped, so nothing secret is stored;
+ * a value that does not parse as a URL is kept only as a digest.
+ */
+export function endpointIdentity(baseUrl: string | undefined): string {
+  if (!baseUrl) return '';
+  try {
+    const url = new URL(baseUrl);
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return `sha256:${createHash('sha256').update(baseUrl).digest('hex')}`;
+  }
+}
+
+/**
  * The server settings that change an extractor's output without changing its
- * version. No credentials: a key changes who pays, not what comes back.
+ * version: the endpoint it calls (a self-hosted or overridden service decides
+ * the model behind it), the MinerU backend, and for local media the ASR
+ * provider, model and endpoint. No credentials: a key changes who pays, not
+ * what comes back.
  */
 export function defaultResultOptions(extractorId: string): Record<string, string> {
-  if (extractorId === 'mineru') return { backend: getMinerUBackend() };
   if (extractorId === 'local-ffmpeg') {
     const asrProvider = resolveServerASRProviderId() ?? '';
-    return { asrProvider, asrModel: (asrProvider && resolveASRModel(asrProvider)) || '' };
+    return {
+      asrProvider,
+      asrModel: (asrProvider && resolveASRModel(asrProvider)) || '',
+      asrEndpoint: asrProvider ? endpointIdentity(resolveASRBaseUrl(asrProvider)) : '',
+    };
   }
-  return {};
+  const endpoint = endpointIdentity(resolvePDFBaseUrl(extractorId));
+  return {
+    ...(endpoint ? { endpoint } : {}),
+    ...(extractorId === 'mineru' ? { backend: getMinerUBackend() } : {}),
+  };
 }
 
 /**
@@ -196,18 +235,24 @@ export async function runClaimedOwnerExtraction(
   const mime = claim.mime ?? 'application/octet-stream';
   const plan = await planSourceExtraction({ bytes, mime }, claim.originalName, dependencies);
 
-  const planned = plannedExtractor(plan);
-  const plannedKey = ownerExtractionCacheKey(claim.sha256, planned, resultOptions(planned.id));
-  if (plannedKey) {
-    const hit = await findOwnerExtractionCacheHit(persistence.pool, claim.materialId, plannedKey);
-    if (hit && !state.lost) {
-      const reused = await publishReused(persistence, claim, plannedKey, hit, createId, now());
-      if (reused !== 'miss') return reused;
-    }
-  }
+  /** Publish the owner's earlier result of `extractor`, if one still holds. */
+  const reuse = async (extractor: {
+    id: string;
+    version: string;
+  }): Promise<OwnerExtractionRunOutcome | undefined> => {
+    const key = ownerExtractionCacheKey(claim.sha256, extractor, resultOptions(extractor.id));
+    if (!key || state.lost) return undefined;
+    const hit = await findOwnerExtractionCacheHit(persistence.pool, claim.materialId, key);
+    if (!hit) return undefined;
+    const reused = await publishReused(persistence, claim, key, hit, createId, now());
+    return reused === 'miss' ? undefined : reused;
+  };
+
+  const extracted = await extractOrReuse(plan, claim.originalName, reuse);
+  if (extracted.kind === 'reused') return extracted.outcome;
+  const outcome = extracted.outcome;
 
   if (state.lost) return 'not-authorized';
-  const outcome = await runSourceExtraction(plan, claim.originalName);
   const options = resultOptions(outcome.extractor.id);
   const textBytes = Buffer.from(outcome.text, 'utf8');
   const textAssetId = await allocate(persistence, claim, state, textBytes, 'text/markdown');
@@ -254,10 +299,50 @@ export async function runClaimedOwnerExtraction(
 }
 
 /**
+ * Walk the plan's extractors in their order, trying the owner's earlier
+ * result of each one before running it: a document fallback that once
+ * succeeded is reused when the providers ahead of it fail, exactly as it
+ * would have been run. The failure when every extractor fails is the one the
+ * session chain reports.
+ */
+async function extractOrReuse(
+  plan: SourceExtractionPlan,
+  title: string | null,
+  reuse: (extractor: {
+    id: string;
+    version: string;
+  }) => Promise<OwnerExtractionRunOutcome | undefined>,
+): Promise<
+  | { kind: 'reused'; outcome: OwnerExtractionRunOutcome }
+  | { kind: 'extracted'; outcome: SourceExtractionOutcome }
+> {
+  if (plan.kind === 'media') {
+    const reused = await reuse(plannedExtractor(plan));
+    if (reused) return { kind: 'reused', outcome: reused };
+    return { kind: 'extracted', outcome: await runSourceExtraction(plan, title) };
+  }
+  const errors: string[] = [];
+  const failures: unknown[] = [];
+  for (const provider of plan.candidates) {
+    const reused = await reuse({ id: provider.id, version: provider.version });
+    if (reused) return { kind: 'reused', outcome: reused };
+    try {
+      const artifact = await extractWithDocumentProvider(provider, plan.input);
+      return { kind: 'extracted', outcome: documentOutcome(artifact, provider) };
+    } catch (error) {
+      errors.push(documentFailureLine(provider, error));
+      failures.push(error);
+    }
+  }
+  throw documentExtractionFailure(errors, failures);
+}
+
+/**
  * Publish an earlier result of the same owner for this source: the same
  * pool entries, rooted again under this source and derivatives of its own.
  * `miss` when the earlier result no longer holds -- its source changed or was
- * deleted, or an entry it named is gone -- so the caller extracts instead.
+ * deleted, a root it held is withdrawn, or an entry it named is gone -- so
+ * the caller extracts instead.
  */
 async function publishReused(
   persistence: Persistence,
@@ -269,7 +354,17 @@ async function publishReused(
 ): Promise<OwnerExtractionRunOutcome | 'miss'> {
   const publication: OwnerExtractionPublication = {
     cacheKey,
-    donor: { materialId: hit.materialId, revision: hit.result.revision },
+    donor: {
+      materialId: hit.materialId,
+      revision: hit.result.revision,
+      roots: [
+        { rootId: hit.materialId, assetId: hit.result.text.assetId },
+        ...hit.result.derivatives.map((derivative) => ({
+          rootId: derivative.id,
+          assetId: derivative.assetId,
+        })),
+      ],
+    },
     text: hit.result.text,
     extractor: hit.result.extractor,
     stats: hit.result.stats,

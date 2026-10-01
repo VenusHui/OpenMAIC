@@ -34,6 +34,7 @@ import {
   deletedSourceScenario,
   ensure,
   ensureStartedScenario,
+  fallbackReuseScenario,
   heartbeatLossScenario,
   expire,
   mediaDerivativeScenario,
@@ -47,6 +48,7 @@ import {
   stateOf,
   supersededClaimScenario,
   twoConversationsOneExtractionScenario,
+  withdrawnDonorScenario,
   type ExtractionHarness,
 } from './_owner-extraction-scenarios';
 
@@ -193,6 +195,14 @@ describe.skipIf(!contractUrl)('owner-level material extraction on PostgreSQL', (
 
   it('keeps both results when a claim brings the same content into an account that has it', async () => {
     await claimIntoSameContentScenario(await boot());
+  });
+
+  it('reuses a document fallback s earlier result when the provider ahead of it fails', async () => {
+    await fallbackReuseScenario(await boot());
+  });
+
+  it('does not reuse a done donor that no longer roots its result', async () => {
+    await withdrawnDonorScenario(await boot());
   });
 
   describe('races', () => {

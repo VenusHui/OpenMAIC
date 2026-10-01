@@ -731,7 +731,11 @@ export async function ownerCacheScenario(h: ExtractionHarness): Promise<void> {
       lateHit,
       {
         cacheKey: donor.text.assetId,
-        donor: { materialId: 'vid-1', revision: donor.revision },
+        donor: {
+          materialId: 'vid-1',
+          revision: donor.revision,
+          roots: [{ rootId: 'vid-1', assetId: donor.text.assetId }],
+        },
         text: donor.text,
         extractor: donor.extractor,
         stats: donor.stats,
@@ -1098,4 +1102,68 @@ export async function claimIntoSameContentScenario(h: ExtractionHarness): Promis
   const reused = (await stateOf(h, 'vid-next')).extraction_result!;
   expect(['vid-anon', 'vid-account']).toContain(reused.reusedFrom);
   expect(await rootsOf(h, 'vid-next')).toEqual([reused.text.assetId]);
+}
+
+/**
+ * A document fallback that once succeeded is reused when the provider ahead
+ * of it fails again: the preferred provider runs (and fails) as before, the
+ * fallback does not run a second time.
+ */
+export async function fallbackReuseScenario(h: ExtractionHarness): Promise<void> {
+  const flaky = vi.fn(async () => {
+    throw Object.assign(new Error('upstream unavailable'), { status: 503 });
+  });
+  const fallback = h.documentExtract;
+  const provider = (id: string, extract: ReturnType<typeof vi.fn>): DocumentExtractorProvider => ({
+    ...documentProvider(extract),
+    id: id as never,
+  });
+  const deps = h.deps({
+    providers: () => [provider('test-flaky', flaky), provider('test-doc', fallback)],
+  });
+  const bytes = Buffer.from('%PDF-fallback');
+  for (const id of ['doc-first', 'doc-second']) {
+    await seedSource(h, id, { bytes });
+    await ensure(h, id);
+  }
+  await drain(h, deps);
+  expect(flaky).toHaveBeenCalledTimes(2);
+  expect(fallback).toHaveBeenCalledTimes(1);
+  const first = (await stateOf(h, 'doc-first')).extraction_result!;
+  const second = (await stateOf(h, 'doc-second')).extraction_result!;
+  expect(first.extractor).toMatchObject({ id: 'test-doc' });
+  expect(second).toMatchObject({ reusedFrom: 'doc-first', text: first.text });
+  expect(await rootsOf(h, 'doc-second')).toEqual([first.text.assetId]);
+}
+
+/**
+ * A donor that is still `done` but no longer roots its result -- its entries
+ * still exist, unreferenced -- is not reused: a hit needs a result something
+ * still keeps alive, and reusing it would revive entries on their way out.
+ */
+export async function withdrawnDonorScenario(h: ExtractionHarness): Promise<void> {
+  const bytes = Buffer.from('%PDF-withdrawn');
+  await seedSource(h, 'doc-donor', { bytes });
+  await ensure(h, 'doc-donor');
+  await drain(h);
+  const donor = (await stateOf(h, 'doc-donor')).extraction_result!;
+  await h.provider.withTransaction((tx) =>
+    changeAssetRoots(tx, {
+      principals: [`owner:${ACCOUNT}`],
+      remove: [{ rootKind: 'material', rootId: 'doc-donor', assetIds: [donor.text.assetId] }],
+    }),
+  );
+  expect(await entryExists(h, donor.text.assetId)).toBe(true);
+  await seedSource(h, 'doc-after', { bytes });
+  await ensure(h, 'doc-after');
+  await drain(h);
+  expect(h.documentExtract).toHaveBeenCalledTimes(2);
+  const fresh = (await stateOf(h, 'doc-after')).extraction_result!;
+  expect(fresh.reusedFrom).toBeUndefined();
+  expect(fresh.text.assetId).not.toBe(donor.text.assetId);
+  const stamped = await h.pool.query<{ unreferenced: boolean }>(
+    'SELECT unreferenced_at IS NOT NULL AS unreferenced FROM asset_entries WHERE id = $1',
+    [donor.text.assetId],
+  );
+  expect(stamped.rows[0]).toEqual({ unreferenced: true });
 }

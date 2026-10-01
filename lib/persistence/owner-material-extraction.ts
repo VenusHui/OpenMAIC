@@ -20,8 +20,11 @@
  *
  * - `extraction_token`: the current claim. Every claim mints a fresh one and
  *   every write of a claim names it, so a worker whose lease was taken over,
- *   or that comes back after a manual restart, writes nothing -- even when
- *   the same process claims the source again.
+ *   or that comes back after a manual restart, cannot publish, settle or
+ *   renew -- even when the same process claims the source again. An
+ *   allocation it starts afterwards is refused; one already under way when
+ *   it loses the claim can leave a pending entry, which it can never publish
+ *   and which expires.
  * - `extraction_claims`: claims since the last explicit start. Each claim,
  *   a takeover of an expired lease included, spends one; a source whose
  *   lease keeps expiring fails once the budget is spent instead of being
@@ -114,11 +117,18 @@ export type OwnerExtractionPublication = Omit<OwnerExtractionResult, 'revision' 
   /** Null when the source has no reliable content identity: never a cache hit. */
   cacheKey: string | null;
   /**
-   * For a cache hit, the source the result is reused from and the revision
-   * it was read at: both are re-checked under lock, so a donor deleted or
-   * changed since reading is a miss, not a publication.
+   * For a cache hit, the source the result is reused from, the revision it
+   * was read at and the roots it keeps the result under: all re-checked
+   * under lock, so a donor deleted, changed or no longer holding its result
+   * since reading is a miss, not a publication. A cache entry keeps nothing
+   * alive; only a result something still roots is reused.
    */
-  donor?: { materialId: string; revision: string };
+  donor?: {
+    materialId: string;
+    revision: string;
+    /** Every root the donor holds its result under; each must still exist. */
+    roots: Array<{ rootId: string; assetId: string }>;
+  };
 };
 
 export type PublishOutcome = 'published' | 'not-authorized' | 'donor-changed';
@@ -313,9 +323,10 @@ export async function settleOwnerMaterialExtractionFailure(
  * {@link OwnerExtractionClaimLostError} unless the claim is still the current
  * one of an undeleted source of `ownerId`. A plain read, deliberately not a
  * row lock: an allocation writes bytes, and a lock held across that write
- * would block the claim's own heartbeat. It saves a superseded worker the
- * allocation and the quota; whether the claim may publish is decided again,
- * under lock, when it publishes.
+ * would block the claim's own heartbeat. So it refuses an allocation by a
+ * claim that is already superseded, but a claim superseded after this check
+ * can still commit its pending entry; whether the claim may publish is
+ * decided again, under lock, when it publishes.
  */
 export async function checkOwnerExtractionClaim(
   tx: Queryable,
@@ -390,6 +401,23 @@ export async function publishOwnerMaterialExtraction(
         donor.status !== 'done' ||
         result?.revision !== publication.donor.revision
       ) {
+        return 'donor-changed' as const;
+      }
+      // The donor's row lock is the one a withdrawal of its roots takes first,
+      // so these rows cannot change before this transaction ends.
+      const held = await tx.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+           FROM asset_root_refs AS roots
+           JOIN unnest($2::text[], $3::text[]) AS wanted(root_id, asset_id)
+             ON roots.root_kind = $1 AND roots.root_id = wanted.root_id
+            AND roots.asset_id = wanted.asset_id`,
+        [
+          MATERIAL_ROOT_KIND,
+          publication.donor.roots.map((root) => root.rootId),
+          publication.donor.roots.map((root) => root.assetId),
+        ],
+      );
+      if (Number(held.rows[0]?.count ?? 0) !== publication.donor.roots.length) {
         return 'donor-changed' as const;
       }
     }
