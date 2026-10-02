@@ -1,7 +1,11 @@
 import { PGlite } from '@electric-sql/pglite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
+import { ensureAssetSchema } from '@openmaic/storage/asset/pg';
+import {
+  nodePostgresTransaction,
+  type ConnectableQueryable,
+} from '@openmaic/storage/server/reference';
 
 import {
   ensureOwnerMaterialSchema,
@@ -98,7 +102,15 @@ describe('owner material reservations', () => {
     const db = new PGlite();
     await db.waitReady;
     await ensureOwnerMaterialSchema(db);
+    // The uploading-row deletes withdraw material roots, which live there.
+    await ensureAssetSchema(db);
     pool = new PGlitePool(db);
+  });
+
+  /** What the reclaim needs of the provider: the pool and its transactions. */
+  const persistence = () => ({
+    pool: pool as never,
+    withTransaction: nodePostgresTransaction(pool as unknown as ConnectableQueryable),
   });
 
   afterEach(async () => {
@@ -218,11 +230,7 @@ describe('owner material reservations', () => {
       expect(objectKey).toBe('materials/owner-1/mat-crash');
     });
 
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
 
     expect(deleteBytes).toHaveBeenCalledTimes(1);
     expect(deleteBytes).toHaveBeenCalledWith('materials/owner-1/mat-crash');
@@ -241,19 +249,11 @@ describe('owner material reservations', () => {
       .mockRejectedValueOnce(new Error('registry unavailable'))
       .mockResolvedValue(undefined);
 
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
     // First pass: removal failed, so the reservation stays for the next pass.
     expect(await rowById(pool.db, 'mat_stale')).not.toBeNull();
 
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
     expect(deleteBytes).toHaveBeenCalledTimes(2);
     expect(await rowById(pool.db, 'mat_stale')).toBeNull();
   });
@@ -266,11 +266,7 @@ describe('owner material reservations', () => {
     });
 
     const deleteBytes = vi.fn().mockResolvedValue(undefined);
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
 
     expect(deleteBytes).not.toHaveBeenCalled();
     expect(await rowById(pool.db, 'mat_empty')).toBeNull();
@@ -286,11 +282,7 @@ describe('owner material reservations', () => {
     });
 
     const deleteBytes = vi.fn().mockResolvedValue(undefined);
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
 
     expect(deleteBytes).not.toHaveBeenCalled();
     expect(await rowById(pool.db, 'mat_fresh')).toMatchObject({ status: 'uploading' });

@@ -26,6 +26,7 @@ import {
 
 import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
 import { getMaterialByteStore } from '@/lib/server/materials/bytes';
+import { readOwnerMaterialBytes } from '@/lib/server/materials/owner-material-bytes';
 
 import { getAgentSessionStore } from './store';
 import { isPptxMaterial } from './pptx-mime';
@@ -314,7 +315,10 @@ async function bindOwnerMaterial(
   byteStore: ReturnType<typeof getMaterialByteStore>,
   sessionId: string,
   ownerMaterialId: string,
-  record: Pick<OwnerMaterialRecord, 'ossKey' | 'mime' | 'originalName' | 'bytes'>,
+  record: Pick<
+    OwnerMaterialRecord,
+    'id' | 'ownerId' | 'assetId' | 'ossKey' | 'mime' | 'originalName' | 'bytes'
+  >,
 ): Promise<AgentSessionMaterial> {
   const existing = await store.getMaterialByOwnerMaterialId(sessionId, ownerMaterialId);
   if (existing) return existing;
@@ -336,7 +340,8 @@ async function bindOwnerMaterial(
 
   let source: Buffer;
   try {
-    source = await byteStore.get(record.ossKey);
+    // Pool first, the pre-pool object otherwise; see readOwnerMaterialBytes.
+    source = await readOwnerMaterialBytes(record);
   } catch {
     throw new SessionMaterialBindingError(`material ${ownerMaterialId} bytes are unavailable`);
   }

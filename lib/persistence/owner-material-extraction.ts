@@ -57,14 +57,10 @@
  * the library operation's job (Phase 2), not this module's.
  */
 import type { Queryable, WithTransaction } from '@openmaic/storage/document/pg';
-import { changeAssetRoots } from '@openmaic/storage/asset/pg';
 import { encodeJson } from '@openmaic/storage/pg-json';
 
-import { assetPrincipalForOwner } from './owner-assets';
-import { fenceOwnerWrite, forwardOwnerWrite } from './owner-merges';
-
-/** The root kind library materials hold their assets under (`asset_root_refs`). */
-export const MATERIAL_ROOT_KIND = 'material';
+import { MATERIAL_ROOT_KIND, withMaterialRoots } from './material-roots';
+import { fenceOwnerWrite } from './owner-merges';
 
 /** Claims one explicit start may spend, takeovers of an expired lease included. */
 export const MAX_OWNER_EXTRACTION_CLAIMS = 3;
@@ -81,7 +77,10 @@ export interface OwnerExtractionClaim {
   claims: number;
   mime: string | null;
   originalName: string | null;
+  /** The pre-pool object key, `''` for a source in the pool. */
   ossKey: string;
+  /** The pool entry holding the source, or `null` for a pre-pool source. */
+  assetId: string | null;
   sha256: string | null;
   bytes: number;
 }
@@ -152,6 +151,7 @@ interface ClaimRow extends Record<string, unknown> {
   mime: string | null;
   original_name: string | null;
   oss_key: string;
+  asset_id: string | null;
   sha256: string | null;
   bytes: number | string;
 }
@@ -249,7 +249,8 @@ export async function claimNextOwnerMaterialExtraction(
         WHERE material.id = candidate.id
         RETURNING material.id, material.owner_id, (material.extraction->>'status') AS status,
                   material.extraction_token, material.extraction_claims, material.mime,
-                  material.original_name, material.oss_key, material.sha256, material.bytes`,
+                  material.original_name, material.oss_key, material.asset_id, material.sha256,
+                  material.bytes`,
       [staleBefore, token, options.now, maxClaims, statusJson('running'), statusJson('failed')],
     );
     const row = result.rows[0];
@@ -263,6 +264,7 @@ export async function claimNextOwnerMaterialExtraction(
       mime: row.mime,
       originalName: row.original_name,
       ossKey: row.oss_key,
+      assetId: row.asset_id,
       sha256: row.sha256,
       bytes: Number(row.bytes),
     };
@@ -362,21 +364,19 @@ export async function publishOwnerMaterialExtraction(
   publication: OwnerExtractionPublication,
   now: number,
 ): Promise<PublishOutcome> {
-  return withTransaction(async (tx) => {
-    // Background work: a claim of the owner since this run started moves
-    // the write to the account, which is where the source row now is.
-    const ownerId = await forwardOwnerWrite(tx, claim.ownerId);
-    const lockIds = [
-      claim.materialId,
-      ...(publication.donor ? [publication.donor.materialId] : []),
-    ];
+  const lockIds = [claim.materialId, ...(publication.donor ? [publication.donor.materialId] : [])];
+  // Background work: a claim of the owner since this run started moves the
+  // write to the account, which is where the source row now is. The wrapper
+  // takes that forwarded fence, then these rows' locks in one ascending
+  // statement, before anything below runs.
+  const locks = { ownerId: claim.ownerId, fence: 'background' as const, materialIds: lockIds };
+  return withMaterialRoots({ withTransaction }, locks, async ({ tx, ownerId, changeRoots }) => {
     const locked = await tx.query<LockedRow>(
       `SELECT id, owner_id, kind, folder_id, deleted_at, ${STATUS} AS status,
               extraction_token, extraction_result
          FROM owner_material
         WHERE id = ANY($1::text[])
-        ORDER BY id
-          FOR UPDATE`,
+        ORDER BY id`,
       [lockIds],
     );
     const byId = new Map(locked.rows.map((row) => [row.id, row]));
@@ -425,17 +425,11 @@ export async function publishOwnerMaterialExtraction(
     // Every asset the result keeps, under the material that keeps it. One
     // call, after the material locks, as the root contract requires; an
     // asset that is gone or no longer this owner's refuses the whole call.
-    await changeAssetRoots(tx, {
-      principals: [assetPrincipalForOwner(ownerId).key],
+    await changeRoots({
       add: [
-        {
-          rootKind: MATERIAL_ROOT_KIND,
-          rootId: claim.materialId,
-          assetIds: [publication.text.assetId],
-        },
+        { materialId: claim.materialId, assetIds: [publication.text.assetId] },
         ...publication.derivatives.map((derivative) => ({
-          rootKind: MATERIAL_ROOT_KIND,
-          rootId: derivative.id,
+          materialId: derivative.id,
           assetIds: [derivative.assetId],
         })),
       ],

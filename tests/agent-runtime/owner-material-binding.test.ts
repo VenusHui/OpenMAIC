@@ -62,7 +62,11 @@ import {
   bindOwnerMaterialsToSession,
   getSessionMaterial,
   listSessionMaterials,
+  resolveSessionMaterialRawAsset,
 } from '@/lib/server/agent-runtime/session-materials';
+import { PgAssetByteStore } from '@openmaic/storage/asset/pg-bytes';
+import { PgAssetStore, ensureAssetSchema } from '@openmaic/storage/asset/pg';
+import { assetPrincipalForOwner } from '@/lib/persistence/owner-assets';
 
 let dbCounter = 0;
 let db: PGlite | undefined;
@@ -302,5 +306,46 @@ describe('owner-material binding across sessions', () => {
     // violation, `withRequestOwner` swallowed it, and the response was 500.
     const second = await post({ prompt: 'Build the sequel', materialIds: ['mat_owner'] });
     expect(second.status).toBe(202);
+  });
+
+  it('binds an upload that exists only in the pool next to one from before it', async () => {
+    const { db: instance, bytes, sessionStore } = await makeHost();
+    await ensureAssetSchema(instance);
+    const assetStore = new PgAssetStore(instance, {
+      byteStore: new PgAssetByteStore(instance),
+      withTransaction: (body) => instance.transaction((tx: Queryable) => body(tx)),
+    });
+    mocks.getServerPersistenceProvider.mockResolvedValue({ pool: instance, assetStore });
+    await sessionStore.createSession({ id: 'session-mixed', ownerId: 'owner-1', prompt: 'p' });
+
+    // A pre-pool upload, read by its object key.
+    await seedOwnerMaterial(instance, 'mat_old');
+    bytes.set('owner/mat_old/raw', Buffer.from('OLD'));
+    // A pool-only upload: a pointer, no object key, nothing in the byte store.
+    const assetId = await assetStore.put(
+      assetPrincipalForOwner('owner-1'),
+      new Blob([Buffer.from('NEW')], { type: 'application/pdf' }),
+    );
+    await instance.query(
+      `INSERT INTO owner_material
+         (id, owner_id, kind, mime, bytes, original_name, oss_key, asset_id, status, extraction,
+          created_at)
+       VALUES ('mat_new', 'owner-1', 'source', 'application/pdf', 3, 'new.pdf', '', $1, 'ready',
+               NULL, $2)`,
+      [assetId, Date.now()],
+    );
+
+    const bound = await bindOwnerMaterialsToSession('session-mixed', 'owner-1', [
+      'mat_old',
+      'mat_new',
+    ]);
+
+    const read = async (materialId: string) => {
+      const row = await getSessionMaterial('session-mixed', materialId);
+      const raw = await resolveSessionMaterialRawAsset('session-mixed', row!.rawAssetId!);
+      return raw!.bytes.toString();
+    };
+    expect(await read(bound[0]!.materialId)).toBe('OLD');
+    expect(await read(bound[1]!.materialId)).toBe('NEW');
   });
 });

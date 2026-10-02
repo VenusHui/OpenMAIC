@@ -22,12 +22,16 @@
  *   A body larger than its declared content-length is a separate 413 and
  *   does not include `maxBytes`.
  * - Lifecycle: the upload reclaims crashed `uploading` leftovers older than
- *   24 hours (their byte objects first, then the reservations), reserves a
- *   quota-checked `uploading` row (429 when the owner's count or byte quota is
- *   exceeded), streams the bytes through a sha256 meter into the byte store,
- *   and finalizes the row to `ready` with the digest. Failures
- *   abandon the reservation; crash leftovers are reclaimed by the next
- *   upload's 24-hour sweep.
+ *   24 hours (the byte objects of reservations made before the asset pool
+ *   first, then the reservations), reserves a quota-checked `uploading` row
+ *   (429 when the owner's count or byte quota is exceeded), reads the body
+ *   through a sha256 meter, allocates a pending entry for the bytes in the
+ *   owner's asset pool partition (507 when the pool quota has no room), and
+ *   publishes the pointer, the material root and `ready` in one transaction.
+ *   Failures abandon the reservation and never delete stored bytes: an
+ *   unpublished entry expires on its own. A retired or busy owner answers
+ *   403 / 503 at any write. Crash leftovers are reclaimed by the next upload's
+ *   24-hour sweep.
  * - Every response echoes the `x-request-id` header so the uploader can pair
  *   a failure with its log line.
  *
@@ -53,11 +57,14 @@ import {
   listSessionMaterials,
   publicMaterialView,
 } from '@/lib/server/agent-runtime/session-materials';
+import { AssetQuotaExceededError } from '@openmaic/storage';
+
 import {
   abandonOwnerMaterial,
-  finalizeOwnerMaterial,
+  allocateOwnerMaterialBytes,
   MaterialQuotaExceededError,
   publicMaterial,
+  publishOwnerMaterialUpload,
   reclaimStaleOwnerMaterialUploads,
   registerOwnerMaterial,
 } from '@/lib/persistence/owner-materials';
@@ -80,16 +87,6 @@ const MEDIA_MIME_SET = new Set<string>(MEDIA_MIME_TYPES);
 
 /** The store's keyset-paging ceiling (default 50, capped at 200). */
 export const MAX_MATERIAL_LIST_LIMIT = 200;
-
-/**
- * Byte-store key for an owner-scoped material upload.
- * Sanitizes the owner id (which may contain `:`) because that character breaks
- * the local byte store's `mkdir` on Windows; the encoding is deterministic so
- * read/write/delete all resolve the same key.
- */
-export function ownerMaterialObjectKey(ownerId: string, materialId: string): string {
-  return `materials/${ownerId.replace(/[^A-Za-z0-9._-]/g, '_')}/${materialId}`;
-}
 
 class MaterialPayloadTooLarge extends Error {}
 
@@ -246,10 +243,13 @@ export async function POST(req: NextRequest) {
       }
       const createdMaterialId = createMaterialId();
       materialId = createdMaterialId;
-      const ossKey = ownerMaterialObjectKey(ownerId, createdMaterialId);
 
       const provider = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
+      // Only the reclaim below still uses the material byte store: a
+      // reservation made before the asset pool names an object there.
       const byteStore = getMaterialByteStore();
+      const abandon = () =>
+        abandonOwnerMaterial(provider, ownerId, createdMaterialId).catch(() => undefined);
 
       // Browsers send Content-Length for a File body. When an intermediary
       // strips it, reserve the per-file maximum so an unmeasured stream can
@@ -258,27 +258,24 @@ export async function POST(req: NextRequest) {
       const reservedBytes =
         Number.isFinite(declaredBytes) && declaredBytes > 0 ? declaredBytes : uploadLimit;
 
-      // Reclaim uploads that crashed before finalize and are older than the
-      // 24-hour horizon. Each reservation's byte object is removed first; the reservation is
-      // deleted only after that, so a failure here keeps the reservation for
-      // the next pass instead of losing the pointer to its bytes.
+      // Reclaim uploads that crashed before they were published and are older
+      // than the 24-hour horizon. A pre-pool reservation's byte object is
+      // removed first; the reservation is deleted only after that, so a
+      // failure here keeps the reservation for the next pass instead of losing
+      // the pointer to its bytes.
       phase = 'reclaim_stale_uploads';
-      await reclaimStaleOwnerMaterialUploads(
-        provider.pool as unknown as ConnectableQueryable,
-        ownerId,
-        async (objectKey) => {
-          try {
-            await byteStore.delete(objectKey);
-          } catch (error) {
-            console.warn(
-              'material stale byte deletion failed; keeping its reservation for the next pass',
-              context({ objectKey }),
-              error,
-            );
-            throw error;
-          }
-        },
-      ).catch((error) => {
+      await reclaimStaleOwnerMaterialUploads(provider, ownerId, async (objectKey) => {
+        try {
+          await byteStore.delete(objectKey);
+        } catch (error) {
+          console.warn(
+            'material stale byte deletion failed; keeping its reservation for the next pass',
+            context({ objectKey }),
+            error,
+          );
+          throw error;
+        }
+      }).catch((error) => {
         console.warn(
           'material stale-upload reclaim failed; retrying on the next upload',
           context(),
@@ -297,7 +294,8 @@ export async function POST(req: NextRequest) {
             mime,
             bytes: reservedBytes,
             originalName,
-            ossKey,
+            // In the pool once published; nothing is ever stored under a key.
+            ossKey: '',
             extraction: { status: 'idle' },
           },
           {
@@ -327,24 +325,15 @@ export async function POST(req: NextRequest) {
         receivedBytes = bytes.byteLength;
       } catch (error) {
         if (error instanceof MaterialPayloadTooLarge) {
-          await abandonOwnerMaterial(
-            provider.pool as unknown as ConnectableQueryable,
-            createdMaterialId,
-          ).catch(() => undefined);
+          await abandon();
           return reject(materialTooLarge(uploadLimit), 'streamed_body_too_large', responseHeaders);
         }
         failureLogged = true;
-        await abandonOwnerMaterial(
-          provider.pool as unknown as ConnectableQueryable,
-          createdMaterialId,
-        ).catch(() => undefined);
+        await abandon();
         throw error;
       }
       if (bytes.byteLength === 0) {
-        await abandonOwnerMaterial(
-          provider.pool as unknown as ConnectableQueryable,
-          createdMaterialId,
-        ).catch(() => undefined);
+        await abandon();
         return reject(
           apiError('INVALID_REQUEST', 400, 'empty body'),
           'empty_stream',
@@ -352,10 +341,7 @@ export async function POST(req: NextRequest) {
         );
       }
       if (bytes.byteLength > reservedBytes) {
-        await abandonOwnerMaterial(
-          provider.pool as unknown as ConnectableQueryable,
-          createdMaterialId,
-        ).catch(() => undefined);
+        await abandon();
         return reject(
           apiError('INVALID_REQUEST', 413, 'upload body exceeds its declared content length'),
           'declared_length_mismatch',
@@ -363,57 +349,63 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // The object key is recorded by the reservation before bytes are stored.
-      // A crash after the write therefore leaves a durable pointer for the
-      // 24-hour reclaim, preserving delete-before-reservation-removal order.
+      // Allocate, then publish. Neither step's failure deletes anything that
+      // was stored: an allocation nothing published expires like any pending
+      // pool entry, and `abandon` only matches a row still `uploading`, so it
+      // is safe even when a publication may have committed before its answer
+      // was lost -- a published row is `ready` and is left as it is.
       const hash = createHash('sha256').update(bytes).digest('hex');
-      let bytesStored = false;
+      let row: Awaited<ReturnType<typeof publishOwnerMaterialUpload>>;
       try {
-        await byteStore.put(ossKey, bytes, mime);
-        bytesStored = true;
-        const row = await finalizeOwnerMaterial(
-          provider.pool as unknown as ConnectableQueryable,
-          createdMaterialId,
-          bytes.byteLength,
-          hash,
-        );
-        const view = publicMaterial(row);
-        const res = NextResponse.json(
-          {
-            materialId: view.materialId,
-            originalName: view.originalName,
-            bytes: view.bytes,
-            mime: view.mime,
-            extraction: view.extraction,
-          },
-          { status: 201 },
-        );
-        res.headers.set('x-request-id', requestId);
-        for (const [key, value] of responseHeaders) res.headers.append(key, value);
-        console.info('material upload completed', context({ status: 201 }));
-        return res;
+        phase = 'allocate_bytes';
+        const assetId = await allocateOwnerMaterialBytes(provider, ownerId, bytes, mime);
+        phase = 'publish_material';
+        row = await publishOwnerMaterialUpload(provider, ownerId, createdMaterialId, {
+          assetId,
+          bytes: bytes.byteLength,
+          sha256: hash,
+        });
       } catch (error) {
-        let bytesDeleted = !bytesStored;
-        if (bytesStored) {
-          try {
-            await byteStore.delete(ossKey);
-            bytesDeleted = true;
-          } catch (cleanupError) {
-            console.warn(
-              'material byte cleanup failed; keeping its reservation for stale reclaim',
-              context({ objectKey: ossKey }),
-              cleanupError,
-            );
-          }
+        await abandon();
+        if (error instanceof AssetQuotaExceededError) {
+          return reject(
+            apiError('ASSET_QUOTA_EXCEEDED', 507, 'asset storage quota exceeded'),
+            'asset_quota_exceeded',
+            responseHeaders,
+          );
         }
-        if (bytesDeleted) {
-          await abandonOwnerMaterial(
-            provider.pool as unknown as ConnectableQueryable,
-            createdMaterialId,
-          ).catch(() => undefined);
-        }
+        const claimed = ownerWriteErrorResponse(error);
+        if (claimed) return reject(claimed, 'owner_claim', responseHeaders);
         throw error;
       }
+      if (row === 'refused') {
+        await abandon();
+        failureLogged = true;
+        console.error(
+          'material upload failed',
+          context({ status: 500, reason: 'publication_refused' }),
+        );
+        const res = apiError('INTERNAL_ERROR', 500, 'material upload failed');
+        res.headers.set('x-request-id', requestId);
+        for (const [key, value] of responseHeaders) res.headers.append(key, value);
+        return res;
+      }
+
+      const view = publicMaterial(row);
+      const res = NextResponse.json(
+        {
+          materialId: view.materialId,
+          originalName: view.originalName,
+          bytes: view.bytes,
+          mime: view.mime,
+          extraction: view.extraction,
+        },
+        { status: 201 },
+      );
+      res.headers.set('x-request-id', requestId);
+      for (const [key, value] of responseHeaders) res.headers.append(key, value);
+      console.info('material upload completed', context({ status: 201 }));
+      return res;
     } catch (error) {
       if (!failureLogged) console.error('material upload failed', context({ status: 500 }), error);
       const res = apiError('INTERNAL_ERROR', 500, 'material upload failed');

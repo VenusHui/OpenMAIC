@@ -8,8 +8,9 @@
  *
  * ## One run
  *
- * 1. Read the source's bytes (`readSource`; today the neutral material byte
- *    store by the row's object key) and choose the extractor.
+ * 1. Read the source's bytes (`readSource`; by default the asset pool, or the
+ *    material byte store for a source from before the pool, see
+ *    `readOwnerMaterialBytes`) and choose the extractor.
  * 2. Before each extractor runs -- the preferred one, then each document
  *    fallback in turn -- look for the owner's own earlier result under that
  *    extractor's cache key and, when there is one, publish it for this source
@@ -53,7 +54,7 @@ import {
 import { forwardOwnerWrite } from '@/lib/persistence/owner-merges';
 import type { ServerPersistenceProvider } from '@/lib/persistence/server-provider';
 import { getMinerUBackend } from '@/lib/pdf/pdf-providers';
-import { getMaterialByteStore } from '@/lib/server/materials/bytes';
+import { readOwnerMaterialBytes } from '@/lib/server/materials/owner-material-bytes';
 import {
   resolveASRBaseUrl,
   resolveASRModel,
@@ -216,9 +217,18 @@ function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+/**
+ * The source's original bytes, pool first. The claim's owner is the one the
+ * source had when it was claimed; after a claim of that owner the reader finds
+ * the source's owner now (see `readOwnerMaterialBytes`).
+ */
 async function defaultReadSource(claim: OwnerExtractionClaim): Promise<Buffer> {
-  if (!claim.ossKey) throw new Error(`source material ${claim.materialId} has no stored bytes`);
-  return getMaterialByteStore().get(claim.ossKey);
+  return readOwnerMaterialBytes({
+    id: claim.materialId,
+    ownerId: claim.ownerId,
+    assetId: claim.assetId,
+    ossKey: claim.ossKey,
+  });
 }
 
 /** Run one claimed source to a publication, a refusal, or a thrown failure. */

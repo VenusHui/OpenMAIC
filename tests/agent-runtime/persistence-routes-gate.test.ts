@@ -74,6 +74,31 @@ vi.mock('@/lib/persistence/server-provider', () => ({
 vi.mock('@/lib/server/agent-runtime/owner-scoped-documents', () => ({
   getOwnerScopedDocumentStore: async () => mocks.fakeStore!.store,
 }));
+// The upload's pool steps (allocation, then the root-and-pointer publication)
+// have suites of their own; here they only need to succeed.
+vi.mock('@/lib/persistence/owner-materials', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/persistence/owner-materials')>();
+  return {
+    ...actual,
+    allocateOwnerMaterialBytes: async () => 'asset-1',
+    publishOwnerMaterialUpload: async (_persistence: unknown, ownerId: string, id: string) => ({
+      id,
+      ownerId,
+      kind: 'source' as const,
+      derivedFrom: null,
+      mime: 'application/pdf',
+      bytes: 5,
+      originalName: 'notes.pdf',
+      ossKey: '',
+      assetId: 'asset-1',
+      sha256: 'abc',
+      status: 'ready' as const,
+      extraction: { status: 'idle' as const },
+      createdAt: 1,
+      deletedAt: null,
+    }),
+  };
+});
 vi.mock('@/lib/server/agent-runtime/session-materials', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('@/lib/server/agent-runtime/session-materials')>();

@@ -8,18 +8,24 @@
  * branch's agent-session materials stay session-scoped (the agent tools' list
  * surface); this table is the owner's durable library that the uploader feeds.
  *
- * Bytes live in the neutral material byte store. The row records its private
- * object key, matching the reference metadata shape without vendor storage.
+ * An upload's bytes live in the asset pool, under the owner's own partition:
+ * the row's `asset_id` points at the entry and a `('material', id)` reference
+ * root keeps it alive. Rows from before the pool hold a private object key in
+ * the material byte store (`oss_key`) instead, until the backfill moves them;
+ * readers take the pool pointer first.
  *
  * ## Upload lifecycle
  *
  * An upload reserves a row with `status = 'uploading'` (quota-checked against
- * the owner's active source materials), streams its bytes into the byte
- * byte store through a sha256 meter, then finalizes the row to `'ready'` with
- * the digest. A failed upload abandons the row; a process death leaves
- * `uploading` rows behind, which the next upload's 24-hour reclaim removes --
- * its object first, then the reservation, so a crash mid-reclaim never loses
- * the pointer to the bytes.
+ * the owner's active source materials, `oss_key = ''`), reads its body through
+ * a sha256 meter, allocates a pending pool entry for the bytes
+ * ({@link allocateOwnerMaterialBytes}), then publishes the pointer, the root
+ * and `'ready'` in one transaction ({@link publishOwnerMaterialUpload}). A
+ * failed upload abandons the row and leaves any pending entry to expire; a
+ * process death leaves `uploading` rows behind, which the next upload's 24-hour
+ * reclaim removes. Rows reserved before the pool still name an object, which
+ * the reclaim deletes first, then the reservation, so a crash mid-reclaim never
+ * loses the pointer to the bytes.
  */
 import { splitSqlStatements, type Queryable } from '@openmaic/storage/document/pg';
 import { encodeJson } from '@openmaic/storage/pg-json';
@@ -28,6 +34,12 @@ import {
   type ConnectableQueryable,
 } from '@openmaic/storage/server/reference';
 
+import type { BinaryBlob } from '@openmaic/dsl';
+import type { WithTransaction } from '@openmaic/storage/document/pg';
+import type { AssetStore } from '@openmaic/storage';
+
+import { MATERIAL_ROOT_KIND, withMaterialRoots } from './material-roots';
+import { assetPrincipalForOwner } from './owner-assets';
 import { ensureOwnerMergeSchema, fenceOwnerWrite } from './owner-merges';
 
 export const OWNER_MATERIAL_STATUSES = ['uploading', 'ready'] as const;
@@ -50,8 +62,10 @@ export interface OwnerMaterialRecord {
   mime: string | null;
   bytes: number;
   originalName: string | null;
-  /** Private material-byte-store object key. */
+  /** Private material-byte-store object key of a pre-pool row; `''` once in the pool or never stored. */
   ossKey: string;
+  /** The asset pool entry holding the original, or `null` for a row not in the pool. */
+  assetId: string | null;
   /** Null only while status=uploading; finalized ready rows always carry a digest. */
   sha256: string | null;
   status: OwnerMaterialStatus;
@@ -157,8 +171,9 @@ END
 $$;
 
 -- Library columns. All nullable: a process that predates them still inserts
--- rows without them. Only a claim reads or writes folder_id so far
--- (reassignMaterialFolders); nothing reads asset_id or display_name yet.
+-- rows without them. asset_id is the pool pointer uploads publish and readers
+-- take first; only a claim reads or writes folder_id so far
+-- (reassignMaterialFolders); nothing reads display_name yet.
 ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS asset_id TEXT;
 ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS folder_id TEXT;
 ALTER TABLE owner_material ADD COLUMN IF NOT EXISTS display_name TEXT;
@@ -243,6 +258,7 @@ interface RawOwnerMaterialRow extends Record<string, unknown> {
   bytes: number | string;
   original_name: string | null;
   oss_key: string;
+  asset_id: string | null;
   sha256: string | null;
   status: string;
   extraction: unknown;
@@ -258,6 +274,7 @@ const OWNER_MATERIAL_COLUMNS = `id,
   bytes,
   original_name,
   oss_key,
+  asset_id,
   sha256,
   status,
   extraction,
@@ -274,6 +291,7 @@ function rowToRecord(row: RawOwnerMaterialRow): OwnerMaterialRecord {
     bytes: Number(row.bytes),
     originalName: row.original_name,
     ossKey: row.oss_key,
+    assetId: row.asset_id,
     sha256: row.sha256,
     status: row.status as OwnerMaterialStatus,
     extraction: extractionOf(row.extraction),
@@ -326,27 +344,41 @@ export function ownerMaterialQuotaLockKey(ownerId: string): string {
 }
 
 /**
- * Reclaim uploads that crashed before finalize and are older than the sweep
- * horizon.
+ * What the upload paths need of the server persistence provider: its pool, its
+ * transactions, and the asset registry pinned to one of them.
+ */
+export interface OwnerMaterialPersistence {
+  pool: Queryable;
+  withTransaction: WithTransaction;
+  assetStoreIn(queryable: Queryable): AssetStore;
+}
+
+/**
+ * Reclaim uploads that crashed before they were published and are older than
+ * the sweep horizon.
  *
- * Order is load-bearing: each stale reservation's byte object is removed
+ * Order is load-bearing for a reservation made before the asset pool, which
+ * still names an object in the material byte store: that object is removed
  * first, and only then is the reservation deleted. Deleting the reservation
  * first would lose the pointer to its bytes on a crash between the two, so the
  * object would remain orphaned forever. A reservation whose byte deletion
- * throws is left in place (still quota-counted)
- * and the next pass retries it.
+ * throws is left in place (still quota-counted) and the next pass retries it.
+ * A reservation made since names no object (`oss_key = ''`); the pending pool
+ * entry its upload may have allocated expires on its own.
+ *
+ * Each reservation is then deleted as {@link abandonOwnerMaterial} deletes one.
  *
  * @param deleteBytes Reclaims one recorded object key; must resolve when the
  *   object is removed or confirmed already absent, and throw to keep the
  *   reservation for the next pass.
  */
 export async function reclaimStaleOwnerMaterialUploads(
-  queryable: Queryable,
+  persistence: Pick<OwnerMaterialPersistence, 'pool' | 'withTransaction'>,
   ownerId: string,
   deleteBytes: (ossKey: string) => Promise<void>,
 ): Promise<void> {
   const staleBefore = Date.now() - STALE_UPLOAD_AGE_MS;
-  const stale = await queryable.query<{ id: string; oss_key: string }>(
+  const stale = await persistence.pool.query<{ id: string; oss_key: string }>(
     `SELECT id, oss_key
        FROM owner_material
       WHERE owner_id = $1
@@ -364,11 +396,7 @@ export async function reclaimStaleOwnerMaterialUploads(
         continue;
       }
     }
-    await queryable.query(
-      `DELETE FROM owner_material
-        WHERE id = $1 AND status = 'uploading'`,
-      [row.id],
-    );
+    await deleteUploadingRow(persistence, ownerId, row.id);
   }
 }
 
@@ -440,7 +468,13 @@ export async function registerOwnerMaterial(
   });
 }
 
-/** Finalize a successfully stored object. Reserved bytes may only shrink. */
+/**
+ * Finalize a reservation whose bytes were stored in the material byte store:
+ * the row shape uploads had before the asset pool (`oss_key`, no pointer, no
+ * root). The upload route no longer calls it; it stays because tests build the
+ * pre-pool rows the read path and the backfill must still handle with it.
+ * Reserved bytes may only shrink.
+ */
 export async function finalizeOwnerMaterial(
   queryable: Queryable,
   materialId: string,
@@ -461,14 +495,137 @@ export async function finalizeOwnerMaterial(
   return rowToRecord(result.rows[0]);
 }
 
-/** Remove a failed reservation; crash leftovers are handled by the 24h lazy sweep. */
-export async function abandonOwnerMaterial(
-  queryable: Queryable,
+/**
+ * Allocate the pool entry an upload's bytes go into: a pending entry under the
+ * owner's own partition, in a transaction of its own that takes the owner's
+ * write fence first (a retired owner is refused, as every request write is).
+ * Nothing names the entry until {@link publishOwnerMaterialUpload} roots it; an
+ * entry never published expires like any pending allocation.
+ *
+ * @throws AssetQuotaExceededError when the owner's pool quota has no room.
+ */
+export async function allocateOwnerMaterialBytes(
+  persistence: Pick<OwnerMaterialPersistence, 'withTransaction' | 'assetStoreIn'>,
+  ownerId: string,
+  bytes: Buffer,
+  mime: string,
+): Promise<string> {
+  // A view over the received bytes rather than a copy of them.
+  const part = new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+  const blob: BinaryBlob = new Blob([part], { type: mime });
+  return persistence.withTransaction(async (tx) => {
+    await fenceOwnerWrite(tx, ownerId);
+    return persistence
+      .assetStoreIn(tx)
+      .put(assetPrincipalForOwner(ownerId), blob, { contentType: mime });
+  });
+}
+
+/**
+ * Publish an upload: its pool pointer, its `('material', id)` root and
+ * `'ready'`, in one transaction (see `./material-roots.ts` for the fence and
+ * lock order). Refused, writing nothing, unless the row is still this owner's
+ * live reservation with room for the bytes and no pointer yet -- a publication
+ * never replaces a pointer. Reserved bytes may only shrink.
+ *
+ * Throws what the request fence throws for a retired or busy owner.
+ */
+export async function publishOwnerMaterialUpload(
+  persistence: Pick<OwnerMaterialPersistence, 'withTransaction'>,
+  ownerId: string,
+  materialId: string,
+  input: { assetId: string; bytes: number; sha256: string },
+): Promise<OwnerMaterialRecord | 'refused'> {
+  return withMaterialRoots(
+    persistence,
+    { ownerId, fence: 'request', materialIds: [materialId] },
+    async ({ tx, ownerId: owner, changeRoots }) => {
+      const current = await tx.query<{
+        owner_id: string;
+        status: string;
+        deleted_at: number | string | null;
+        bytes: number | string;
+        asset_id: string | null;
+      }>(
+        `SELECT owner_id, status, deleted_at, bytes, asset_id
+           FROM owner_material
+          WHERE id = $1`,
+        [materialId],
+      );
+      const row = current.rows[0];
+      if (
+        !row ||
+        row.owner_id !== owner ||
+        row.status !== 'uploading' ||
+        row.deleted_at !== null ||
+        Number(row.bytes) < input.bytes ||
+        row.asset_id !== null
+      ) {
+        return 'refused' as const;
+      }
+      await changeRoots({ add: [{ materialId, assetIds: [input.assetId] }] });
+      const published = await tx.query<RawOwnerMaterialRow>(
+        `UPDATE owner_material
+            SET bytes = $2, sha256 = $3, status = 'ready', asset_id = $4
+          WHERE id = $1
+          RETURNING ${OWNER_MATERIAL_COLUMNS}`,
+        [materialId, input.bytes, input.sha256, input.assetId],
+      );
+      return rowToRecord(published.rows[0]!);
+    },
+  );
+}
+
+/**
+ * Delete one reservation that is still `uploading`, withdrawing any material
+ * root it holds in the same transaction. A published upload never matches, so
+ * this is safe to call when it is not known whether a publication committed.
+ *
+ * The fence follows a claim (`'background'`): a claim moves reservations with
+ * the rest of the owner's materials, and removing the moved row for the
+ * account is what the cleanup is for. Uploads write no root before they are
+ * published, so the withdrawal normally finds none; it is there so that a
+ * deleted row can never leave a root holding its bytes and quota.
+ */
+async function deleteUploadingRow(
+  persistence: Pick<OwnerMaterialPersistence, 'withTransaction'>,
+  ownerId: string,
   materialId: string,
 ): Promise<void> {
-  await queryable.query(`DELETE FROM owner_material WHERE id = $1 AND status = 'uploading'`, [
-    materialId,
-  ]);
+  await withMaterialRoots(
+    persistence,
+    { ownerId, fence: 'background', materialIds: [materialId] },
+    async ({ tx, changeRoots }) => {
+      const current = await tx.query<{ status: string }>(
+        'SELECT status FROM owner_material WHERE id = $1',
+        [materialId],
+      );
+      if (current.rows[0]?.status !== 'uploading') return;
+      const roots = await tx.query<{ asset_id: string }>(
+        `SELECT asset_id FROM asset_root_refs
+          WHERE root_kind = $1 AND root_id = $2
+          ORDER BY asset_id`,
+        [MATERIAL_ROOT_KIND, materialId],
+      );
+      if (roots.rows.length > 0) {
+        await changeRoots({
+          remove: [{ materialId, assetIds: roots.rows.map((root) => root.asset_id) }],
+        });
+      }
+      await tx.query(`DELETE FROM owner_material WHERE id = $1 AND status = 'uploading'`, [
+        materialId,
+      ]);
+    },
+  );
+}
+
+/** Remove a failed reservation; crash leftovers are handled by the 24h lazy sweep. */
+export async function abandonOwnerMaterial(
+  persistence: Pick<OwnerMaterialPersistence, 'withTransaction'>,
+  ownerId: string,
+  materialId: string,
+): Promise<void> {
+  await deleteUploadingRow(persistence, ownerId, materialId);
 }
 
 /** List the owner's ready library materials, newest first. */
