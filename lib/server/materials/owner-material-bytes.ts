@@ -10,10 +10,12 @@
  *
  * The caller's record can be older than the row in two ways that matter, and
  * one re-read of the row after a failed first read covers both. The re-read
- * and the pool read run in one short transaction that first takes the record
+ * and the pool read run in one transaction that first takes the record
  * owner's write fence (`forwardOwnerWrite`, the shared identity lock): a claim
  * of that owner takes the lock exclusively, so the row's owner cannot change
- * between the re-read and the read of the entry.
+ * between the re-read and the read of the entry. The lock is held through the
+ * whole pool read, byte-store I/O included, so a claim of that owner waits for
+ * it; only the wait to take the fence is bounded (`OWNER_WRITE_LOCK_WAIT_MS`).
  *
  * - **The backfill moved it.** The backfill deletes an old object only after
  *   the row's pool pointer has committed (`./migrate-to-pool.ts`), and nothing
@@ -67,7 +69,7 @@ async function readOnce(location: OwnerMaterialLocation): Promise<Buffer | null>
 
 /**
  * Re-read the row and read its pool entry, both under the fence of the
- * record's owner: the row's owner cannot change between the two statements.
+ * record's owner: the row's owner cannot change between the two reads.
  * `null` when the row has no pool pointer or its entry has no bytes.
  */
 async function rereadAndReadPool(record: OwnerMaterialLocation): Promise<Buffer | null> {
