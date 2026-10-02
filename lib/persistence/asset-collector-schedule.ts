@@ -4,11 +4,12 @@
  * It has two levels, and this application runs both. A registry entry is
  * released once it is either a pending allocation no document claimed before
  * `ASSET_PENDING_TTL_MS` ran out, or a committed entry whose last document
- * reference left longer ago than the grace period; its bytes then wait out the
- * same grace and go on a later pass. Nothing on a request path deletes either:
- * `PgAssetStore.remove`, and a `replace` that changes content, only stamp
- * `unreferenced_at`, and this application refuses `remove` to every browser
- * outright. `AssetCollector` is the sole deletion path in the design.
+ * reference (a document's or a reference root's) left longer ago than the
+ * grace period; its bytes then wait out the same grace and go on a later pass.
+ * Nothing on a request path deletes bytes: `PgAssetStore.remove` deletes only
+ * the caller's own registry row and stamps the blob, a `replace` that changes
+ * content stamps the old blob, and both refuse an entry a reference root holds.
+ * `AssetCollector` is the sole path that deletes bytes.
  *
  * Leaving it to "the deployment" is not a decision this repository can defer,
  * because the deployment it ships is `docker-compose.yml` — the app and

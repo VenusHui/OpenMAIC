@@ -78,6 +78,16 @@ export async function register(): Promise<void> {
       runner = runtime.startAgentRunner();
       const extraction = await import('@/lib/server/material-extraction/runner');
       extractionRunner = extraction.startMaterialExtractionRunner();
+      // Moving pre-pool material uploads into the asset pool is opt-in: it
+      // deletes their old objects, so an operator turns it on only once every
+      // instance runs this release (see lib/server/materials/migrate-to-pool.ts).
+      // One bounded pass per start; it never blocks register().
+      if (process.env.MATERIALS_POOL_BACKFILL === '1') {
+        void import('@/lib/server/materials/migrate-to-pool')
+          .then(({ migrateOwnerMaterialsToPool }) => migrateOwnerMaterialsToPool())
+          .then((report) => console.info('[material-backfill] pass finished', report))
+          .catch((error) => console.error('[material-backfill] pass failed', error));
+      }
     }
   } catch (error) {
     console.error('[instrumentation] Agent runtime startup failed', error);
