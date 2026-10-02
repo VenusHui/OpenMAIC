@@ -453,6 +453,55 @@ describe('runtime and assets are keyed by the resolved owner', () => {
       expect(await principalOf(id)).toBeUndefined();
     });
 
+    it('refuses every generic path to replace or delete the owner’s own entry while a root holds it', async () => {
+      const { changeAssetRoots, AssetRootedError } = await import('@openmaic/storage/asset/pg');
+      const { getServerPersistenceProvider } = await import('@/lib/persistence/server-provider');
+      const { assetPrincipalForOwner, createOwnerAssetStore } =
+        await import('@/lib/persistence/owner-assets');
+      const provider = await getServerPersistenceProvider(process.env.DATABASE_URL!);
+      const id = await allocate('alice');
+      const principal = assetPrincipalForOwner(ALICE);
+      await pool.query('BEGIN');
+      await changeAssetRoots(pool as never, {
+        add: [{ rootKind: 'material', rootId: 'mat-alice', assetIds: [id] }],
+        principals: [principal.key],
+      });
+      await pool.query('COMMIT');
+
+      // The app route: the owner wrapper in front of the storage handler.
+      const put = await call('alice', `/assets/${id}/content`, {
+        method: 'PUT',
+        body: assetForm([9]),
+      });
+      expect(put.status).toBe(409);
+      expect(await put.json()).toMatchObject({ error: { code: 'ASSET_ROOTED' } });
+      const deleted = await call('alice', `/assets/${id}`, { method: 'DELETE' });
+      expect(deleted.status).toBe(409);
+
+      // Server code calling the registry directly, pinned to a transaction or not.
+      await expect(
+        provider.withTransaction((tx) => provider.assetStoreIn(tx).remove(principal, id)),
+      ).rejects.toBeInstanceOf(AssetRootedError);
+      await expect(provider.assetStore.remove(principal, id)).rejects.toBeInstanceOf(
+        AssetRootedError,
+      );
+      const wrapped = createOwnerAssetStore(provider.assetStore, {
+        ownerId: ALICE,
+        queryable: pool as never,
+        transactions: { withTransaction: provider.withTransaction, storeIn: provider.assetStoreIn },
+      });
+      await expect(
+        wrapped.replace(principal, id as never, new Blob([new Uint8Array([8])])),
+      ).rejects.toBeInstanceOf(AssetRootedError);
+
+      const intact = await call('alice', `/assets/${id}/content`);
+      expect(new Uint8Array(await intact.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+      const roots = await pool.query('SELECT root_id FROM asset_root_refs WHERE asset_id = $1', [
+        id,
+      ]);
+      expect(roots.rows).toEqual([{ root_id: 'mat-alice' }]);
+    });
+
     it('accounts quota per owner', async () => {
       vi.stubEnv('ASSET_QUOTA_BYTES', '4');
       // The provider reads the quota when it is built; build a fresh one.

@@ -11,6 +11,7 @@ import { PgAssetByteStore } from '../src/asset/pg-bytes.js';
 import {
   AssetQuotaExceededError,
   AssetRootTargetError,
+  AssetRootedError,
   PgAssetStore,
   changeAssetRoots,
   ensureAssetSchema,
@@ -1947,6 +1948,211 @@ describe.skipIf(!contractUrl)('document asset references with PostgreSQL 16', ()
             AND constraint_name = 'asset_root_refs_asset_id_fkey'`,
       );
       expect(foreignKey.rows).toEqual([{ delete_rule: 'CASCADE' }]);
+    });
+
+    describe('the generic mutation paths against a concurrent root writer', () => {
+      /**
+       * Wait until `waiter` itself queues behind `holder`, not merely until
+       * someone does. Gives up well inside the test timeout, so a failure
+       * reaches the cleanup below instead of leaving a paused transaction
+       * holding its locks.
+       */
+      const waitUntilWaiting = async (waiter: number, holder: number): Promise<void> => {
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+          const blocked = await pool.query<{ blocked: boolean }>(
+            'SELECT $2::int = ANY(pg_blocking_pids($1::int)) AS blocked',
+            [waiter, holder],
+          );
+          if (blocked.rows[0]?.blocked) return;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        throw new Error('the operation under test never queued behind the holder');
+      };
+
+      /**
+       * A store whose transaction reports its own backend pid once it has begun
+       * and, when `pauseAfter` matches a statement, stops right after it --
+       * holding every lock taken so far -- until `release` is called.
+       */
+      const instrumentedStore = (pauseAfter?: RegExp) => {
+        let reportPid!: (pid: number) => void;
+        const pid = new Promise<number>((resolve) => {
+          reportPid = resolve;
+        });
+        let reachedPause!: () => void;
+        const paused = new Promise<void>((resolve) => {
+          reachedPause = resolve;
+        });
+        let release!: () => void;
+        const mayProceed = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const withTransaction: WithTransaction = async (body) => {
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+            reportPid(await backendPid(client as Queryable));
+            const result = await body({
+              async query<TRow extends Record<string, unknown> = Record<string, unknown>>(
+                text: string,
+                params?: unknown[],
+              ): Promise<QueryResult<TRow>> {
+                const answer = await (client as Queryable).query<TRow>(text, params);
+                if (pauseAfter?.test(text)) {
+                  reachedPause();
+                  await mayProceed;
+                }
+                return answer;
+              },
+            });
+            await client.query('COMMIT');
+            return result;
+          } catch (error) {
+            await client.query('ROLLBACK').catch(() => undefined);
+            throw error;
+          } finally {
+            client.release();
+          }
+        };
+        const store = new PgAssetStore(pool as Queryable, { byteStore: bytes, withTransaction });
+        return { store, pid, paused, release };
+      };
+
+      /** A root writer in a transaction of its own, reporting its backend pid. */
+      const startRootWriter = (id: string) => {
+        let reportPid!: (pid: number) => void;
+        const pid = new Promise<number>((resolve) => {
+          reportPid = resolve;
+        });
+        const done = transactionFor(pool)(async (queryable) => {
+          reportPid(await backendPid(queryable));
+          await change(queryable, addTo('material-1', id));
+        });
+        return { pid, done };
+      };
+
+      /**
+       * Hold a committed-later root on `id` in an open transaction, start
+       * `mutate` on an instrumented store, prove that store's own backend is
+       * waiting on the holder, then commit the root. Whatever fails on the way,
+       * the holder rolls back and `mutate` is settled before this returns.
+       */
+      const mutateBehindRoot = async (
+        id: string,
+        mutate: (store: PgAssetStore) => Promise<unknown>,
+      ): Promise<{ mutation: Promise<unknown> }> => {
+        const holder = await pool.connect();
+        const mutator = instrumentedStore();
+        let mutation: Promise<unknown> | undefined;
+        try {
+          await holder.query('BEGIN');
+          const holderPid = await backendPid(holder as Queryable);
+          await change(holder as Queryable, addTo('material-1', id));
+          mutation = mutate(mutator.store);
+          mutation.catch(() => undefined);
+          await waitUntilWaiting(await mutator.pid, holderPid);
+          await holder.query('COMMIT');
+          return { mutation };
+        } finally {
+          await holder.query('ROLLBACK').catch(() => undefined);
+          holder.release();
+          await mutation?.catch(() => undefined);
+        }
+      };
+
+      /**
+       * Pause `mutate` right after `pauseAfter` with its entry lock held, start
+       * a root writer, prove the root writer's own backend waits on it, then let
+       * the mutation finish. The pause is lifted and both sides are settled
+       * whatever fails on the way.
+       */
+      const rootBehindMutation = async (
+        id: string,
+        pauseAfter: RegExp,
+        mutate: (store: PgAssetStore) => Promise<unknown>,
+      ): Promise<{ mutation: Promise<unknown>; rooting: Promise<void> }> => {
+        const mutator = instrumentedStore(pauseAfter);
+        const mutation = mutate(mutator.store);
+        mutation.catch(() => undefined);
+        let rooting: Promise<void> | undefined;
+        try {
+          await Promise.race([
+            mutator.paused,
+            mutation.then(() => {
+              throw new Error('the mutation finished without reaching its pause point');
+            }),
+          ]);
+          const writer = startRootWriter(id);
+          rooting = writer.done;
+          rooting.catch(() => undefined);
+          await waitUntilWaiting(await writer.pid, await mutator.pid);
+        } finally {
+          mutator.release();
+          await Promise.allSettled([mutation, rooting ?? Promise.resolve()]);
+        }
+        return { mutation, rooting };
+      };
+
+      const textOf = async (id: string): Promise<string | undefined> => {
+        const read = await assets.resolve(principal, id);
+        return read ? Buffer.from(read.bytes).toString() : undefined;
+      };
+
+      test('a remove that queues behind a root writer sees the committed root and refuses', async () => {
+        const id = await assets.put(principal, new Blob(['rooted while waiting']));
+
+        // The remove's FOR UPDATE waits on the root writer's entry lock; the
+        // root commits first, and the check after the wait must see it. A
+        // check folded into the DELETE would keep its older snapshot, delete
+        // the entry and cascade the fresh root away.
+        const { mutation } = await mutateBehindRoot(id, (store) => store.remove(principal, id));
+
+        await expect(mutation).rejects.toBeInstanceOf(AssetRootedError);
+        expect(await entryExists(id)).toBe(true);
+        expect(await rootsOf(id)).toEqual(['material-1']);
+      });
+
+      test('a root writer that queues behind a remove finds the entry gone', async () => {
+        const id = await assets.put(principal, new Blob(['removed first']));
+
+        const { mutation, rooting } = await rootBehindMutation(
+          id,
+          /^\s*DELETE FROM asset_entries/,
+          (store) => store.remove(principal, id),
+        );
+
+        await mutation;
+        await expect(rooting).rejects.toBeInstanceOf(AssetRootTargetError);
+        expect(await entryExists(id)).toBe(false);
+        expect(await rootsOf(id)).toEqual([]);
+      });
+
+      test('a replace that queues behind a root writer refuses and keeps the bytes', async () => {
+        const id = await assets.put(principal, new Blob(['original bytes']));
+
+        const { mutation } = await mutateBehindRoot(id, (store) =>
+          store.replace(principal, id, new Blob(['replacement'])),
+        );
+
+        await expect(mutation).rejects.toBeInstanceOf(AssetRootedError);
+        expect(await textOf(id)).toBe('original bytes');
+        expect(await rootsOf(id)).toEqual(['material-1']);
+      });
+
+      test('a root writer that queues behind a replace roots the replaced entry', async () => {
+        const id = await assets.put(principal, new Blob(['before replace']));
+
+        const { mutation, rooting } = await rootBehindMutation(
+          id,
+          /^\s*UPDATE asset_entries/,
+          (store) => store.replace(principal, id, new Blob(['after replace'])),
+        );
+
+        await mutation;
+        await rooting;
+        expect(await textOf(id)).toBe('after replace');
+        expect(await rootsOf(id)).toEqual(['material-1']);
+      });
     });
 
     describe('the reference-rule version', () => {

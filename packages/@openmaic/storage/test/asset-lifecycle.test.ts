@@ -47,7 +47,11 @@ import {
   syncDocumentAssetReferences,
   syncStageAssetReferences,
 } from '../src/asset/references.js';
-import { AssetQuotaExceededError } from '../src/asset/types.js';
+import {
+  AssetNotFoundError,
+  AssetQuotaExceededError,
+  AssetRootedError,
+} from '../src/asset/types.js';
 import { PgDocumentStore, ensureDocumentSchema } from '../src/document/pg.js';
 import type { MaicDocument } from '../src/document/types.js';
 
@@ -2217,6 +2221,95 @@ describe('asset entry lifecycle with PGlite', () => {
 
       await unroot('material-2', released);
       expect(await lifecycleOf(released)).toEqual(stamped);
+    });
+  });
+
+  describe('the generic mutation paths leave a rooted entry alone', () => {
+    const principals = [PRINCIPAL.key];
+    const root = (rootId: string, ...assetIds: string[]): Promise<void> =>
+      db.transaction((tx: Queryable) =>
+        changeAssetRoots(tx, { principals, add: [{ rootKind: 'material', rootId, assetIds }] }),
+      );
+    const unroot = (rootId: string, ...assetIds: string[]): Promise<void> =>
+      db.transaction((tx: Queryable) =>
+        changeAssetRoots(tx, { principals, remove: [{ rootKind: 'material', rootId, assetIds }] }),
+      );
+    const rootCount = async (id: string): Promise<number> =>
+      (await db.query('SELECT 1 FROM asset_root_refs WHERE asset_id = $1', [id])).rows.length;
+    const entryRow = async (id: string) =>
+      (
+        await db.query<{ content_hash: string; revision: number }>(
+          'SELECT content_hash, revision FROM asset_entries WHERE id = $1',
+          [id],
+        )
+      ).rows[0];
+    const text = async (id: string): Promise<string | undefined> => {
+      const bytes = await store.resolve(PRINCIPAL, id);
+      return bytes ? Buffer.from(bytes.bytes).toString() : undefined;
+    };
+
+    test('remove refuses a rooted entry and changes nothing', async () => {
+      const id = await store.put(PRINCIPAL, new Blob(['kept by a root']));
+      await root('material-1', id);
+      const before = await entryRow(id);
+
+      await expect(store.remove(PRINCIPAL, id)).rejects.toBeInstanceOf(AssetRootedError);
+
+      expect(await entryRow(id)).toEqual(before);
+      expect(await rootCount(id)).toBe(1);
+      expect(await text(id)).toBe('kept by a root');
+    });
+
+    test('replace refuses a rooted entry and writes no bytes or revision', async () => {
+      const id = await store.put(PRINCIPAL, new Blob(['original']));
+      await root('material-1', id);
+      const before = await entryRow(id);
+
+      await expect(store.replace(PRINCIPAL, id, new Blob(['changed']))).rejects.toBeInstanceOf(
+        AssetRootedError,
+      );
+
+      expect(await entryRow(id)).toEqual(before);
+      expect(await rootCount(id)).toBe(1);
+      expect(await text(id)).toBe('original');
+    });
+
+    test("another principal's rooted id is still the silent no-op an unknown id is", async () => {
+      const id = await store.put(PRINCIPAL, new Blob(['someone else']));
+      await root('material-1', id);
+
+      await expect(store.remove({ key: 'other' }, id)).resolves.toBeUndefined();
+      await expect(store.replace({ key: 'other' }, id, new Blob(['x']))).rejects.toBeInstanceOf(
+        AssetNotFoundError,
+      );
+      expect(await rootCount(id)).toBe(1);
+    });
+
+    test('once its root is withdrawn the entry is removable again', async () => {
+      const id = await store.put(PRINCIPAL, new Blob(['let go']));
+      await root('material-1', id);
+      await unroot('material-1', id);
+
+      await expect(store.replace(PRINCIPAL, id, new Blob(['regenerated']))).resolves.toBe(2);
+      await store.remove(PRINCIPAL, id);
+      expect(await entryRow(id)).toBeUndefined();
+    });
+
+    test('a rooted entry whose replacement is also over quota reports the quota', async () => {
+      const quotaStore = new PgAssetStore(db, assetOptions({ quotaBytes: 10 }));
+      const id = await quotaStore.put(PRINCIPAL, new Blob(['12345']));
+      await root('material-1', id);
+      const before = await entryRow(id);
+
+      // The quota check precedes the entry lock (it takes the principal's lock
+      // first), so it answers before the root check does; neither writes.
+      await expect(
+        quotaStore.replace(PRINCIPAL, id, new Blob(['x'.repeat(11)])),
+      ).rejects.toBeInstanceOf(AssetQuotaExceededError);
+      await expect(
+        quotaStore.replace(PRINCIPAL, id, new Blob(['x'.repeat(10)])),
+      ).rejects.toBeInstanceOf(AssetRootedError);
+      expect(await entryRow(id)).toEqual(before);
     });
   });
 

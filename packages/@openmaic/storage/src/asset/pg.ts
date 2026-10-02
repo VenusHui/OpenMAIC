@@ -28,6 +28,7 @@ import { newAssetId, type AssetId } from './id.js';
 import {
   AssetNotFoundError,
   AssetQuotaExceededError,
+  AssetRootedError,
   type AssetBytes,
   type AssetIdentity,
   type AssetIndirectRead,
@@ -49,7 +50,7 @@ export type {
   AssetPrincipal,
   AssetStore,
 } from './types.js';
-export { AssetNotFoundError, AssetQuotaExceededError } from './types.js';
+export { AssetNotFoundError, AssetQuotaExceededError, AssetRootedError } from './types.js';
 export {
   AssetRootInputError,
   AssetRootTargetError,
@@ -129,8 +130,10 @@ export const DEFAULT_ASSET_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
  * document reference: an entry named by a row in EITHER table is referenced.
  * A root keeps an entry alive and nothing more; in particular it does not make
  * the entry readable by any other principal. Like `document_asset_refs` it
- * cascades with its entry, so a `remove` of a rooted entry takes the root
- * with it.
+ * cascades with its entry in the database, but the generic mutation paths
+ * never get that far: `remove` and `replace` refuse an entry any root holds
+ * ({@link AssetRootedError}), so only a direct row delete would take a root
+ * with its entry.
  *
  * `asset_reference_tracking` is a one-row marker, written by a document store
  * configured to maintain references and read by the collector before its
@@ -292,6 +295,26 @@ function registryFailure(operation: string): Error {
 class RegistryAssetNotFound extends Error {}
 
 class RegistryAssetQuotaExceeded extends Error {}
+
+/**
+ * Whether a reference root holds `id`, read in a statement of its own.
+ *
+ * Callers run it right after taking the entry's `FOR UPDATE`. A root insert
+ * takes `KEY SHARE` on the entry (the foreign key) after the root writer's
+ * `FOR NO KEY UPDATE`, so it either committed before that lock was granted --
+ * and this fresh READ COMMITTED snapshot sees it -- or it waits behind this
+ * transaction. Folding the check into the `DELETE` as `NOT EXISTS` would not
+ * do: the subquery keeps the statement's snapshot even after the row lock
+ * wait, so a root committed meanwhile would go unseen and the cascade would
+ * take it away.
+ */
+async function entryIsRooted(queryable: Queryable, id: string): Promise<boolean> {
+  const rooted = await queryable.query<{ rooted: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM asset_root_refs WHERE asset_id = $1) AS rooted`,
+    [id],
+  );
+  return rooted.rows[0]?.rooted === true;
+}
 
 function encodeMeta(meta: AssetMeta): string {
   assertJsonValue(meta, 'asset metadata');
@@ -685,17 +708,29 @@ export class PgAssetStore implements AssetStore {
   /**
    * Delete one entry, and stamp the blob when no entry names it any more.
    *
-   * Unchanged by the entry lifecycle: any `document_asset_refs` or
-   * `asset_root_refs` rows naming this id go with the row through those
-   * tables' `ON DELETE CASCADE`, which
-   * needs no statement here and cannot change the contract that an unknown id
-   * -- or another principal's id -- is the same no-op, because a delete that
-   * matches no row cascades to nothing.
+   * An entry a reference root holds is refused with {@link AssetRootedError}
+   * and left as it is: the root belongs to a record this package does not
+   * interpret, which withdraws the root itself before the asset may go. The
+   * check runs under the entry's row lock, in a statement of its own (see
+   * {@link entryIsRooted}).
+   *
+   * Any `document_asset_refs` rows naming this id go with the row through that
+   * table's `ON DELETE CASCADE`, which needs no statement here. An unknown id
+   * -- or another principal's id -- is the same no-op, because it locks and
+   * deletes no row.
    */
   async remove(principal: AssetPrincipal, ref: AssetRef): Promise<void> {
     if (!isLosslessJsonString(ref) || !isLosslessJsonString(principal.key)) return;
     try {
       await this.writeTransaction(async (queryable) => {
+        const locked = await queryable.query<{ id: string }>(
+          `SELECT id FROM asset_entries
+            WHERE id = $1 AND principal = $2
+            FOR UPDATE`,
+          [ref, principal.key],
+        );
+        if (!locked.rows[0]) return;
+        if (await entryIsRooted(queryable, ref)) throw new AssetRootedError();
         const deleted = await queryable.query<HashRow>(
           `DELETE FROM asset_entries
             WHERE id = $1 AND principal = $2
@@ -714,7 +749,8 @@ export class PgAssetStore implements AssetStore {
           [hash],
         );
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof AssetRootedError) throw error;
       throw registryFailure('remove');
     }
   }
@@ -746,6 +782,12 @@ export class PgAssetStore implements AssetStore {
         );
         const oldEntry = existing.rows[0];
         if (!oldEntry) throw new RegistryAssetNotFound();
+        // Under the entry lock, in a statement of its own: see `entryIsRooted`.
+        // The quota check above stays ahead of the lock (it takes the
+        // principal's lock first, the order `reassignPrincipal` relies on), so
+        // a rooted entry whose replacement would also exceed the quota reports
+        // the quota; either way nothing is written.
+        if (await entryIsRooted(queryable, ref)) throw new AssetRootedError();
 
         await queryable.query(
           `INSERT INTO asset_blobs (content_hash, byte_size, unreferenced_at)
@@ -799,6 +841,7 @@ export class PgAssetStore implements AssetStore {
     } catch (error) {
       if (error instanceof RegistryAssetNotFound) throw new AssetNotFoundError();
       if (error instanceof RegistryAssetQuotaExceeded) throw new AssetQuotaExceededError();
+      if (error instanceof AssetRootedError) throw error;
       throw registryFailure('replace');
     }
   }
